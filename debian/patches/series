@@ -11,7 +11,6 @@ x11-Add-support-for-fractional-scaling-using-Randr.patch
 clutter-stage-cogl-Don-t-skip-over-the-next-frame.patch
 geometry_picking.patch
 add_detail_to_captured_event_signal.patch
-avoid_stage_relayouts.patch
 reschedule_update_on_present.patch
 cogl-enable-egl_img-context-priority.patch
 consolidate_all_frame_throttling_into_clutter_stage_cogl.patch
