@@ -258,6 +258,9 @@ cogl_pixel_format_from_drm_format (uint32_t               drm_format,
                                    CoglPixelFormat       *out_format,
                                    CoglTextureComponents *out_components);
 
+static void
+meta_renderer_native_queue_modes_reset (MetaRendererNative *renderer_native);
+
 static MetaBackend *
 backend_from_renderer_native (MetaRendererNative *renderer_native)
 {
@@ -1277,7 +1280,7 @@ meta_renderer_native_egl_context_created (CoglDisplay *cogl_display,
                                       cogl_display_egl->dummy_surface,
                                       cogl_display_egl->egl_context))
     {
-      _cogl_set_error (error, COGL_WINSYS_ERROR,
+      g_set_error (error, COGL_WINSYS_ERROR,
                    COGL_WINSYS_ERROR_CREATE_CONTEXT,
                    "Failed to make context current");
       return FALSE;
@@ -3036,10 +3039,52 @@ meta_onscreen_native_allocate (CoglOnscreen *onscreen,
 }
 
 static void
+destroy_egl_surface (CoglOnscreen *onscreen)
+{
+  CoglOnscreenEGL *onscreen_egl = onscreen->winsys;
+
+  if (onscreen_egl->egl_surface != EGL_NO_SURFACE)
+    {
+      MetaOnscreenNative *onscreen_native = onscreen_egl->platform;
+      MetaEgl *egl = meta_onscreen_native_get_egl (onscreen_native);
+      CoglFramebuffer *framebuffer = COGL_FRAMEBUFFER (onscreen);
+      CoglContext *cogl_context = framebuffer->context;
+      CoglRenderer *cogl_renderer = cogl_context->display->renderer;
+      CoglRendererEGL *cogl_renderer_egl = cogl_renderer->winsys;
+
+      meta_egl_destroy_surface (egl,
+                                cogl_renderer_egl->edpy,
+                                onscreen_egl->egl_surface,
+                                NULL);
+      onscreen_egl->egl_surface = EGL_NO_SURFACE;
+    }
+}
+
+static void
+discard_onscreen_page_flip_retries (MetaOnscreenNative *onscreen_native)
+{
+  g_list_free_full (onscreen_native->pending_page_flip_retries,
+                    (GDestroyNotify) retry_page_flip_data_free);
+  onscreen_native->pending_page_flip_retries = NULL;
+
+  if (onscreen_native->retry_page_flips_source)
+    {
+      MetaBackend *backend =
+        backend_from_renderer_native (onscreen_native->renderer_native);
+
+      meta_backend_thaw_updates (backend);
+      g_clear_pointer (&onscreen_native->retry_page_flips_source,
+                       g_source_destroy);
+    }
+}
+
+static void
 meta_renderer_native_release_onscreen (CoglOnscreen *onscreen)
 {
   CoglFramebuffer *framebuffer = COGL_FRAMEBUFFER (onscreen);
   CoglContext *cogl_context = framebuffer->context;
+  CoglDisplay *cogl_display = cogl_context_get_display (cogl_context);
+  CoglDisplayEGL *cogl_display_egl = cogl_display->winsys;
   CoglRenderer *cogl_renderer = cogl_context->display->renderer;
   CoglRendererEGL *cogl_renderer_egl = cogl_renderer->winsys;
   CoglOnscreenEGL *onscreen_egl = onscreen->winsys;
@@ -3052,28 +3097,18 @@ meta_renderer_native_release_onscreen (CoglOnscreen *onscreen)
 
   onscreen_native = onscreen_egl->platform;
 
-  g_list_free_full (onscreen_native->pending_page_flip_retries,
-                    (GDestroyNotify) retry_page_flip_data_free);
-  if (onscreen_native->retry_page_flips_source)
+  if (onscreen_egl->egl_surface != EGL_NO_SURFACE &&
+      (cogl_display_egl->current_draw_surface == onscreen_egl->egl_surface ||
+       cogl_display_egl->current_read_surface == onscreen_egl->egl_surface))
     {
-      MetaBackend *backend =
-        backend_from_renderer_native (onscreen_native->renderer_native);
-
-      meta_backend_thaw_updates (backend);
-      g_clear_pointer (&onscreen_native->retry_page_flips_source,
-                       g_source_destroy);
+      if (!_cogl_winsys_egl_make_current (cogl_display,
+                                          cogl_display_egl->dummy_surface,
+                                          cogl_display_egl->dummy_surface,
+                                          cogl_display_egl->egl_context))
+        g_warning ("Failed to clear current context");
     }
 
-  if (onscreen_egl->egl_surface != EGL_NO_SURFACE)
-    {
-      MetaEgl *egl = meta_onscreen_native_get_egl (onscreen_native);
-
-      meta_egl_destroy_surface (egl,
-                                cogl_renderer_egl->edpy,
-                                onscreen_egl->egl_surface,
-                                NULL);
-      onscreen_egl->egl_surface = EGL_NO_SURFACE;
-    }
+  discard_onscreen_page_flip_retries (onscreen_native);
 
   renderer_gpu_data =
     meta_renderer_native_get_gpu_data (onscreen_native->renderer_native,
@@ -3087,6 +3122,8 @@ meta_renderer_native_release_onscreen (CoglOnscreen *onscreen)
 
       free_current_bo (onscreen);
 
+      destroy_egl_surface (onscreen);
+
       if (onscreen_native->gbm.surface)
         {
           gbm_surface_destroy (onscreen_native->gbm.surface);
@@ -3097,6 +3134,9 @@ meta_renderer_native_release_onscreen (CoglOnscreen *onscreen)
     case META_RENDERER_NATIVE_MODE_EGL_DEVICE:
       release_dumb_fb (&onscreen_native->egl.dumb_fb,
                        onscreen_native->render_gpu);
+
+      destroy_egl_surface (onscreen);
+
       if (onscreen_native->egl.stream != EGL_NO_STREAM_KHR)
         {
           MetaEgl *egl = meta_onscreen_native_get_egl (onscreen_native);
@@ -3157,7 +3197,7 @@ meta_renderer_native_supports_mirroring (MetaRendererNative *renderer_native)
   return TRUE;
 }
 
-void
+static void
 meta_renderer_native_queue_modes_reset (MetaRendererNative *renderer_native)
 {
   MetaRenderer *renderer = META_RENDERER (renderer_native);
@@ -3521,6 +3561,37 @@ meta_renderer_native_create_view (MetaRenderer       *renderer,
                                  cogl_display_egl->egl_context);
 
   return view;
+}
+
+static void
+discard_page_flip_retries (MetaRenderer *renderer)
+{
+  GList *l;
+
+  for (l = meta_renderer_get_views (renderer); l; l = l->next)
+    {
+      ClutterStageView *stage_view = l->data;
+      CoglFramebuffer *framebuffer =
+        clutter_stage_view_get_onscreen (stage_view);
+      CoglOnscreen *onscreen = COGL_ONSCREEN (framebuffer);
+      CoglOnscreenEGL *onscreen_egl = onscreen->winsys;
+      MetaOnscreenNative *onscreen_native = onscreen_egl->platform;
+
+      discard_onscreen_page_flip_retries (onscreen_native);
+    }
+}
+
+static void
+meta_renderer_native_rebuild_views (MetaRenderer *renderer)
+{
+  MetaRendererClass *parent_renderer_class =
+    META_RENDERER_CLASS (meta_renderer_native_parent_class);
+
+  discard_page_flip_retries (renderer);
+
+  parent_renderer_class->rebuild_views (renderer);
+
+  meta_renderer_native_queue_modes_reset (META_RENDERER_NATIVE (renderer));
 }
 
 void
@@ -4038,6 +4109,7 @@ create_renderer_gpu_data_egl_device (MetaRendererNative  *renderer_native,
                    G_IO_ERROR_FAILED,
                    "Missing EGL extensions required for EGLDevice renderer: %s",
                    missing_extensions_str);
+      meta_egl_terminate (egl, egl_display, NULL);
       g_free (missing_extensions_str);
       g_free (missing_extensions);
       return NULL;
@@ -4320,6 +4392,7 @@ meta_renderer_native_class_init (MetaRendererNativeClass *klass)
 
   renderer_class->create_cogl_renderer = meta_renderer_native_create_cogl_renderer;
   renderer_class->create_view = meta_renderer_native_create_view;
+  renderer_class->rebuild_views = meta_renderer_native_rebuild_views;
 
   obj_props[PROP_MONITOR_MANAGER] =
     g_param_spec_object ("monitor-manager",
